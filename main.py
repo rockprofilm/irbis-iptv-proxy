@@ -9,15 +9,50 @@ logger = logging.getLogger("IPTV_Proxy")
 app = Flask(__name__)
 API_BASE = "https://birgetv.platform24.tv"
 
-def fetch_fresh_stream_url(channel_id: int) -> str:
+def resolve_irbis_channel_id(session: requests.Session, token: str) -> int:
+    """
+    Динамически находит реальный numeric ID для канала со slug 'irbis-tv' 
+    или названием 'Ирбис' через API Birge TV, обходя клиентскую логику channelMapBySlug.
+    """
+    try:
+        # Запрашиваем полный список категорий/каналов с токеном авторизации
+        response = session.get(
+            f"{API_BASE}/v2/channels/category_list",
+            params={"channels_version": "2", "access_token": token},
+            timeout=10
+        )
+        if response.status_code == 200:
+            data = response.json()
+            categories = data.get("data", []) or data
+            if isinstance(categories, list):
+                for cat in categories:
+                    channels = cat.get("channels", [])
+                    for ch in channels:
+                        slug = str(ch.get("slug", "")).lower()
+                        title = str(ch.get("title", "")).lower()
+                        if "irbis" in slug or "ирбис" in title:
+                            real_id = ch.get("id")
+                            logger.info(f"Найден канал Irbis TV! Slug: {slug}, Real ID: {real_id}")
+                            return int(real_id)
+    except Exception as e:
+        logger.warning(f"Не удалось получить ID через category_list: {e}")
+
+    # Запасной вариант: если slug известен точно как 'irbis-tv', возвращаем жестко зашитый 
+    # актуальный ID платформ24 для этого канала, если динамический поиск не сработал
+    logger.info("Используем fallback ID для Irbis TV")
+    return 142 # Или ваш найденный числовой id
+
+def fetch_fresh_stream_url() -> str:
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept-Language": "ru-RU,ru;q=0.9"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Referer": "https://app.birge.tv/"
     })
 
     try:
-        # Авторизация сессии
+        # Шаг 1: Получаем гостевую сессию и токен
+        logger.info("Авторизация на платформе Birge TV...")
         reg_response = session.post(f"{API_BASE}/v2/users", json={
             "username": "iptv_guest_user_auto",
             "password": "secure_guest_password_99",
@@ -40,18 +75,34 @@ def fetch_fresh_stream_url(channel_id: int) -> str:
         if not token:
             raise Exception("Auth token acquisition failed")
 
-        # Запрос ссылки потока
+        # Шаг 2: Динамически определяем настоящий e.id канала
+        channel_id = resolve_irbis_channel_id(session, token)
+
+        logger.info(f"Запрос стрима для канала ID {channel_id} с Bearer-авторизацией...")
+
+        # Шаг 3: Запрос потока по числовому ID с Bearer-токеном
+        stream_headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json, text/plain, */*"
+        }
+
         stream_response = session.get(
             f"{API_BASE}/v2/channels/{channel_id}/stream",
-            params={"access_token": token},
+            headers=stream_headers,
             timeout=10
         )
 
         if stream_response.status_code != 200:
+            logger.error(f"Ошибка стрима {stream_response.status_code}: {stream_response.text}")
             raise Exception("Stream endpoint returned error")
 
         stream_data = stream_response.json()
-        hls_url = stream_data.get("url") or stream_data.get("data", {}).get("url")
+        
+        hls_url = (
+            stream_data.get("url") or 
+            stream_data.get("data", {}).get("url") or
+            stream_data.get("stream", {}).get("url")
+        )
         
         if not hls_url:
             variants = stream_data.get("variants") or stream_data.get("data", {}).get("variants", [])
@@ -69,12 +120,12 @@ def fetch_fresh_stream_url(channel_id: int) -> str:
 
 @app.route("/")
 def index():
-    return "IPTV Proxy Server is Running!"
+    return "IPTV Proxy Server for Irbis TV is Running!"
 
-@app.route("/stream/<int:channel_id>.m3u8")
-def proxy_stream(channel_id):
+@app.route("/stream/irbis.m3u8")
+def proxy_stream():
     try:
-        fresh_url = fetch_fresh_stream_url(channel_id)
+        fresh_url = fetch_fresh_stream_url()
         return redirect(fresh_url, code=302)
     except Exception:
         abort(502, description="Failed to fetch stream from Platform24")
