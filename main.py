@@ -1,5 +1,6 @@
 import os
 import logging
+import subprocess
 import requests
 from flask import Flask, redirect, abort
 
@@ -7,71 +8,57 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("IPTV_Proxy")
 
 app = Flask(__name__)
-API_BASE = "https://birgetv.platform24.tv"
+VK_LIVE_URL = "https://live.vkvideo.ru/irbis_tv"
 
-def fetch_fresh_stream_url() -> str:
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://app.birge.tv/"
-    })
-
+def get_vk_stream_url() -> str:
+    """
+    Получает актуальную HLS-ссылку напрямую с VK Live через публичный API.
+    """
     try:
-        # Прямой запрос списка каналов или ресурсов платформы без авторизации пользователя, 
-        # чтобы получить валидные куки и сессионные параметры CDN
-        logger.info("Запрос конфигурации платформы...")
-        init_resp = session.get(f"{API_BASE}/v2/platform/configuration", timeout=10)
+        # Используем встроенный публичный JSON-эндпоинт VK Video для получения данных трансляции
+        channel_name = "irbis_tv"
+        api_url = f"https://live.vkvideo.ru/api/v1/video/stream/{channel_name}"
         
-        # ID канала Irbis TV в системе Birge TV (подставьте актуальный числовой ID)
-        channel_id = 142 
-
-        logger.info(f"Запрос прямой ссылки на поток для канала ID {channel_id}...")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": VK_LIVE_URL
+        }
         
-        stream_response = session.get(
-            f"{API_BASE}/v2/channels/{channel_id}/stream",
-            timeout=10
-        )
+        response = requests.get(api_url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            # Извлекаем прямую ссылку на маплист из ответа VK API
+            streams = data.get("data", {}).get("streams", [])
+            for stream in streams:
+                if stream.get("url"):
+                    return stream.get("url")
+                    
+        # Запасной вариант через альтернативный эндпоинт метаданных
+        meta_url = f"https://live.vkvideo.ru/api/v1/channel/{channel_name}"
+        meta_resp = requests.get(meta_url, headers=headers, timeout=10)
+        if meta_resp.status_code == 200:
+            meta_data = meta_resp.json()
+            hls_url = meta_data.get("data", {}).get("channel", {}).get("playback", {}).get("hls")
+            if hls_url:
+                return hls_url
 
-        if stream_response.status_code != 200:
-            logger.error(f"Ошибка API стрима: {stream_response.status_code} - {stream_response.text}")
-            raise Exception("Stream endpoint returned error")
-
-        stream_data = stream_response.json()
-        
-        # Извлекаем URL потока
-        hls_url = (
-            stream_data.get("url") or 
-            stream_data.get("data", {}).get("url") or
-            stream_data.get("stream", {}).get("url")
-        )
-        
-        if not hls_url:
-            variants = stream_data.get("variants") or stream_data.get("data", {}).get("variants", [])
-            if variants and isinstance(variants, list):
-                hls_url = variants[0].get("url")
-
-        if not hls_url:
-            logger.error(f"В ответе нет поля с URL: {stream_data}")
-            raise Exception("HLS URL not found in API response")
-
-        return hls_url
+        raise Exception("VK Live API did not return stream URL")
 
     except Exception as e:
-        logger.exception(f"Error fetching stream: {e}")
+        logger.exception(f"Error extracting VK stream: {e}")
         raise
 
 @app.route("/")
 def index():
-    return "IPTV Proxy Server for Irbis TV is Running!"
+    return "Irbis TV Direct Proxy is Running!"
 
 @app.route("/stream/irbis.m3u8")
 def proxy_stream():
     try:
-        fresh_url = fetch_fresh_stream_url()
+        fresh_url = get_vk_stream_url()
         return redirect(fresh_url, code=302)
     except Exception:
-        abort(502, description="Failed to fetch stream from Platform24")
+        abort(502, description="Failed to fetch direct stream from VK Live")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
